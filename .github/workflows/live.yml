@@ -1,5 +1,5 @@
 
-name: YouTube Snake Live - 11h20m
+name: Snake Game 3 - Single Live 11h20m
 
 on:
   workflow_dispatch:
@@ -8,102 +8,175 @@ permissions:
   contents: read
 
 concurrency:
-  group: snakegame5-youtube-live
+  group: snakegame3-youtube-live
   cancel-in-progress: false
 
 jobs:
-  part1:
+  livestream:
     runs-on: ubuntu-24.04
-    timeout-minutes: 355
-    outputs:
-      deadline: ${{ steps.clock.outputs.deadline }}
+    timeout-minutes: 700
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Set 11h20m deadline
-        id: clock
+      - name: Install required packages
         shell: bash
         run: |
-          echo "deadline=$(( $(date +%s) + 40800 ))" >> "$GITHUB_OUTPUT"
+          sudo apt-get update
+          sudo apt-get install -y \
+            ffmpeg \
+            xvfb \
+            pulseaudio \
+            pulseaudio-utils \
+            xdotool \
+            unclutter \
+            chromium-browser
 
-      - name: Stream first segment
+      - name: Start single continuous livestream
+        shell: bash
+
         env:
           YOUTUBE_STREAM_KEY: ${{ secrets.YOUTUBE_STREAM_KEY }}
-          DEADLINE: ${{ steps.clock.outputs.deadline }}
-          SEGMENT_SECONDS: '19800'
-        shell: bash
+
         run: |
           set -Eeuo pipefail
 
-          : "${YOUTUBE_STREAM_KEY:?Missing stream key}"
-          : "${DEADLINE:?Missing deadline}"
+          : "${YOUTUBE_STREAM_KEY:?Missing YouTube stream key}"
 
-          test -f index.html || exit 1
+          test -f index.html || {
+            echo "ERROR: index.html not found"
+            exit 1
+          }
 
-          sudo apt-get update
-          sudo apt-get install -y \
-            ffmpeg xvfb pulseaudio chromium-browser
+          # TOTAL DURATION: 11 HOURS 20 MINUTES
+          DURATION=40800
+
+          # Deadline starts after installation
+          START_TIME=$(date +%s)
+          END_TIME=$((START_TIME + DURATION))
 
           export DISPLAY=:99
           export PULSE_SINK=GameAudio
+          export PULSE_SERVER=unix:/tmp/pulse-native
 
-          Xvfb :99 -screen 0 1080x1920x24 \
-            -ac +extension GLX +render -noreset \
-            >/tmp/xvfb.log 2>&1 &
+          echo "Starting Snake Game Live"
+          echo "Duration: 11 hours 20 minutes"
+
+          # Start virtual display
+          Xvfb :99 \
+            -screen 0 1080x1920x24 \
+            -ac \
+            +extension GLX \
+            +render \
+            -noreset \
+            > /tmp/xvfb.log 2>&1 &
 
           sleep 3
 
-          pulseaudio --start --exit-idle-time=-1 || true
+          # Start audio server
+          pulseaudio --start \
+            --exit-idle-time=-1 \
+            --disallow-exit \
+            || true
 
+          unset PULSE_SERVER
+
+          sleep 2
+
+          # Create virtual audio output
           pactl load-module module-null-sink \
             sink_name=GameAudio \
-            sink_properties=device.description=GameAudio || true
+            sink_properties=device.description=GameAudio \
+            rate=48000 \
+            channels=2 || true
 
           pactl set-default-sink GameAudio
-          pactl set-default-source GameAudio.monitor || true
 
-          BROWSER=$(command -v chromium-browser || command -v chromium)
+          pactl set-default-source \
+            GameAudio.monitor || true
 
+          export PULSE_SINK=GameAudio
+
+          # Keep audio output active
+          pactl set-sink-mute GameAudio 0
+          pactl set-sink-volume GameAudio 100%
+
+          # Find browser
+          BROWSER=$(command -v chromium-browser || \
+                    command -v chromium || \
+                    command -v google-chrome)
+
+          # Start Chromium
           start_browser() {
+
             "$BROWSER" \
               --no-sandbox \
               --no-first-run \
               --disable-dev-shm-usage \
               --disable-gpu \
+              --disable-background-timer-throttling \
+              --disable-renderer-backgrounding \
+              --disable-backgrounding-occluded-windows \
               --autoplay-policy=no-user-gesture-required \
               --kiosk \
+              --start-fullscreen \
               --window-size=1080,1920 \
               --window-position=0,0 \
+              --user-data-dir=/tmp/snake-live-profile \
               "file://${GITHUB_WORKSPACE}/index.html" \
-              >/tmp/chrome.log 2>&1 &
+              > /tmp/chromium.log 2>&1 &
+
             BROWSER_PID=$!
+
+            sleep 8
+
+            # Click to activate game and audio
+            xdotool mousemove 540 960
+            sleep 1
+            xdotool click 1
+            sleep 2
+
+            # Move cursor away from visible screen
+            xdotool mousemove 1079 1919
+
+            # Hide cursor automatically
+            unclutter -idle 0.1 -root \
+              > /tmp/unclutter.log 2>&1 &
+
+            echo "Browser and audio activation completed"
           }
 
           start_browser
-          sleep 8
 
-          SEGMENT_END=$(( $(date +%s) + SEGMENT_SECONDS ))
+          # Main streaming loop
+          while true; do
 
-          if (( DEADLINE < SEGMENT_END )); then
-            SEGMENT_END=$DEADLINE
-          fi
+            NOW=$(date +%s)
+            REMAINING=$((END_TIME - NOW))
 
-          while (( $(date +%s) < SEGMENT_END )); do
-
-            if ! kill -0 "$BROWSER_PID" 2>/dev/null; then
-              echo "Browser stopped. Restarting."
-              start_browser
-              sleep 5
+            if (( REMAINING <= 0 )); then
+              echo "11h20m deadline reached"
+              break
             fi
 
-            LEFT=$(( SEGMENT_END - $(date +%s) ))
-            (( LEFT > 0 )) || break
+            # Restart browser if it crashes
+            if ! kill -0 "$BROWSER_PID" 2>/dev/null; then
 
-            echo "Part 1 remaining: $LEFT seconds"
+              echo "Browser stopped. Restarting..."
 
-            ffmpeg -nostdin -hide_banner \
-              -loglevel info -stats -stats_period 10 \
+              start_browser
+
+            fi
+
+            echo "Time remaining: $REMAINING seconds"
+
+            # Stream video and audio to YouTube
+            ffmpeg \
+              -nostdin \
+              -hide_banner \
+              -loglevel warning \
+              -stats \
               -thread_queue_size 4096 \
               -f x11grab \
               -framerate 30 \
@@ -111,8 +184,10 @@ jobs:
               -i :99.0 \
               -thread_queue_size 4096 \
               -f pulse \
+              -sample_rate 48000 \
+              -channels 2 \
               -i GameAudio.monitor \
-              -t "$LEFT" \
+              -t "$REMAINING" \
               -map 0:v:0 \
               -map 1:a:0 \
               -c:v libx264 \
@@ -127,120 +202,30 @@ jobs:
               -bufsize 9000k \
               -c:a aac \
               -b:a 128k \
-              -ar 44100 \
+              -ar 48000 \
               -ac 2 \
+              -af "aresample=async=1:first_pts=0" \
+              -flvflags no_duration_filesize \
               -f flv \
-              "rtmp://a.rtmp.youtube.com/live2/${YOUTUBE_STREAM_KEY}" || true
+              "rtmp://a.rtmp.youtube.com/live2/${YOUTUBE_STREAM_KEY}" \
+              || true
 
-            (( $(date +%s) < SEGMENT_END )) || break
+            NOW=$(date +%s)
 
-            echo "FFmpeg stopped. Restarting in 5 seconds."
+            if (( NOW >= END_TIME )); then
+              break
+            fi
+
+            echo "FFmpeg disconnected."
+            echo "Reconnecting in 5 seconds..."
+
             sleep 5
+
           done
 
-          echo "Part 1 completed."
+          echo "Livestream duration completed."
 
-  part2:
-    needs: part1
-    if: ${{ needs.part1.result == 'success' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 355
+          # Stop browser and streaming processes
+          kill "$BROWSER_PID" 2>/dev/null || true
 
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Stream remaining time
-        env:
-          YOUTUBE_STREAM_KEY: ${{ secrets.YOUTUBE_STREAM_KEY }}
-          DEADLINE: ${{ needs.part1.outputs.deadline }}
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          : "${YOUTUBE_STREAM_KEY:?Missing stream key}"
-          : "${DEADLINE:?Missing deadline}"
-
-          test -f index.html || exit 1
-
-          sudo apt-get update
-          sudo apt-get install -y \
-            ffmpeg xvfb pulseaudio chromium-browser
-
-          export DISPLAY=:99
-          export PULSE_SINK=GameAudio
-
-          Xvfb :99 -screen 0 1080x1920x24 \
-            -ac +extension GLX +render -noreset \
-            >/tmp/xvfb.log 2>&1 &
-
-          sleep 3
-
-          pulseaudio --start --exit-idle-time=-1 || true
-
-          pactl load-module module-null-sink \
-            sink_name=GameAudio \
-            sink_properties=device.description=GameAudio || true
-
-          pactl set-default-sink GameAudio
-          pactl set-default-source GameAudio.monitor || true
-
-          BROWSER=$(command -v chromium-browser || command -v chromium)
-
-          "$BROWSER" \
-            --no-sandbox \
-            --no-first-run \
-            --disable-dev-shm-usage \
-            --disable-gpu \
-            --autoplay-policy=no-user-gesture-required \
-            --kiosk \
-            --window-size=1080,1920 \
-            --window-position=0,0 \
-            "file://${GITHUB_WORKSPACE}/index.html" \
-            >/tmp/chrome.log 2>&1 &
-
-          sleep 8
-
-          while (( $(date +%s) < DEADLINE )); do
-
-            LEFT=$(( DEADLINE - $(date +%s) ))
-            (( LEFT > 0 )) || break
-
-            echo "Part 2 remaining: $LEFT seconds"
-
-            ffmpeg -nostdin -hide_banner \
-              -loglevel info -stats -stats_period 10 \
-              -thread_queue_size 4096 \
-              -f x11grab \
-              -framerate 30 \
-              -video_size 1080x1920 \
-              -i :99.0 \
-              -thread_queue_size 4096 \
-              -f pulse \
-              -i GameAudio.monitor \
-              -t "$LEFT" \
-              -map 0:v:0 \
-              -map 1:a:0 \
-              -c:v libx264 \
-              -preset ultrafast \
-              -tune zerolatency \
-              -pix_fmt yuv420p \
-              -r 30 \
-              -g 60 \
-              -keyint_min 60 \
-              -b:v 4500k \
-              -maxrate 5000k \
-              -bufsize 9000k \
-              -c:a aac \
-              -b:a 128k \
-              -ar 44100 \
-              -ac 2 \
-              -f flv \
-              "rtmp://a.rtmp.youtube.com/live2/${YOUTUBE_STREAM_KEY}" || true
-
-            (( $(date +%s) < DEADLINE )) || break
-
-            echo "FFmpeg disconnected. Restarting in 5 seconds."
-            sleep 5
-          done
-
-          echo "11 hours 20 minutes deadline reached."
+          echo "Single-part livestream finished."
