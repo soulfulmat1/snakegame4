@@ -388,6 +388,8 @@ const GHOST_MS     = 5200;
 const BOOST_MS     = 3200;
 const START_LEN    = 4;
 const MAX_LEVEL    = 12;
+const LEVEL_SCORE = 120;
+const STUCK_STEPS = 95;
 
 /* ============================================================
    1B. COLOR THEMES
@@ -591,7 +593,11 @@ const game = {
   ghostTime: 0,
   boostTime: 0,
   best: 0,
-  autoRestartTimer: null
+  autoRestartTimer: null,
+  levelScore: 0,
+  recentHeads: [],
+  stepsWithoutFood: 0,
+  levelTransitions: 0
 };
 
 let particles = [];
@@ -917,72 +923,52 @@ function simulateSnake(snake, nx, ny, grow) {
    8. AI
    ============================================================ */
 function chooseDirection() {
-  if (game.snake.length === 0) return null;
+  if (!game.snake.length) return null;
   const head = game.snake[0];
   const wrap = game.ghostTime > 0;
-  const blocked = makeBlocked(game.snake, game.obstacles, true, true);
-
   const food = game.food;
-  let distToFood = null;
-  if (food) distToFood = bfsFrom(food.x, food.y, blocked, wrap);
-
-  const candidates = [];
-  const tailCell = game.snake[game.snake.length-1];
-
-  for (let i=0;i<4;i++){
-    const key = DIR_KEYS[i];
+  const blocked = makeBlocked(game.snake, game.obstacles, true, game.pendingGrow <= 0);
+  const options = [];
+  for (const key of DIR_KEYS) {
     if (key === OPPOSITE[game.dir]) continue;
-    let nx = head.x + DIRS[key].x;
-    let ny = head.y + DIRS[key].y;
+    let nx = head.x + DIRS[key].x, ny = head.y + DIRS[key].y;
     if (wrap) { nx=(nx+COLS)%COLS; ny=(ny+ROWS)%ROWS; }
-    else if (nx<0||nx>=COLS||ny<0||ny>=ROWS) continue;
-    if (!wrap && game.obstacles.has(nx+","+ny)) continue;
-    const isTail = (nx===tailCell.x && ny===tailCell.y);
-    if (blocked[idx(nx,ny)] && !isTail) continue;
-
+    else if (nx<0 || nx>=COLS || ny<0 || ny>=ROWS) continue;
+    if (game.obstacles.has(nx+","+ny)) continue;
     const eats = food && nx===food.x && ny===food.y;
-    const g = game.pendingGrow + (eats ? food.grow : 0);
-    const sim = simulateSnake(game.snake, nx, ny, g);
-    const sb = makeBlocked(sim, game.obstacles, true, true);
-    const d = bfsFrom(nx, ny, sb, wrap);
+    const tail = game.snake[game.snake.length-1];
+    const tailVacates = game.pendingGrow + (eats ? food.grow : 0) <= 0;
+    const onTail = nx===tail.x && ny===tail.y;
+    if (blocked[idx(nx,ny)] && !(onTail && tailVacates)) continue;
+    const sim = simulateSnake(game.snake,nx,ny,game.pendingGrow+(eats?food.grow:0));
+    const simBlocked = makeBlocked(sim,game.obstacles,true,true);
+    const reachDist = bfsFrom(nx,ny,simBlocked,wrap);
     let reach=0;
-    for (let j=0;j<TOTAL;j++) if (d[j]!==-1) reach++;
-    const simTail = sim[sim.length-1];
-    const tailReach = d[idx(simTail.x, simTail.y)] !== -1;
-
-    let distScore = 9999;
-    if (distToFood) {
-      const dd = distToFood[idx(nx,ny)];
-      if (dd !== -1) distScore = dd;
+    for(let i=0;i<TOTAL;i++) if(reachDist[i]>=0) reach++;
+    const simTail=sim[sim.length-1];
+    const tailReach=reachDist[idx(simTail.x,simTail.y)]>=0;
+    const safe = reach>=sim.length || tailReach;
+    let foodDistance=9999;
+    if(food) {
+      const foodBlocked=makeBlocked(sim,game.obstacles,true,true);
+      foodBlocked[idx(food.x,food.y)]=0;
+      const path=bfsFrom(nx,ny,foodBlocked,wrap);
+      foodDistance=path[idx(food.x,food.y)];
+      if(foodDistance<0) foodDistance=9999;
     }
-
-    candidates.push({
-      dir: key,
-      reach: reach,
-      tailReach: tailReach ? 1 : 0,
-      distScore: distScore,
-      simLen: sim.length
-    });
+    const visits=game.recentHeads.reduce((n,v)=>n+(v===idx(nx,ny)?1:0),0);
+    options.push({dir:key,safe,reach,foodDistance,visits,eats});
   }
-
-  if (!candidates.length) return null;
-
-  candidates.sort((a,b)=>{
-    const aS = (a.reach>=a.simLen || a.tailReach) ? 1 : 0;
-    const bS = (b.reach>=b.simLen || b.tailReach) ? 1 : 0;
-    if (aS !== bS) return bS - aS;
-    if (!aS && !bS) return b.reach - a.reach;
-    if (a.tailReach !== b.tailReach) return b.tailReach - a.tailReach;
-    if (a.distScore !== b.distScore) return a.distScore - b.distScore;
-    return b.reach - a.reach;
+  if(!options.length) return null;
+  options.sort((a,b)=> {
+    if(a.safe!==b.safe) return Number(b.safe)-Number(a.safe);
+    if(a.eats!==b.eats) return Number(b.eats)-Number(a.eats);
+    if(a.foodDistance!==b.foodDistance) return a.foodDistance-b.foodDistance;
+    if(a.visits!==b.visits) return a.visits-b.visits;
+    return b.reach-a.reach;
   });
-
-  return candidates[0].dir;
+  return options[0].dir;
 }
-
-/* ============================================================
-   9. FOOD
-   ============================================================ */
 function pickFoodType() {
   let r = Math.random()*FOOD_TOTAL_WEIGHT;
   for (let i=0;i<FOOD_TYPES.length;i++){
@@ -1051,23 +1037,40 @@ function addObstaclesForLevel(level) {
     for (let i=0;i<cells.length;i++) game.obstacles.add(cells[i].x+","+cells[i].y);
   }
 }
-function checkLevelUp() {
-  const nl = Math.min(1 + Math.floor(game.score / 120), MAX_LEVEL);
-  if (nl > game.level) {
-    game.level = nl;
-    game.stepMs = Math.max(MIN_STEP_MS, BASE_STEP_MS - (nl-1)*9);
-    addObstaclesForLevel(nl);
-    if (game.food && game.obstacles.has(game.food.x+","+game.food.y)) spawnFood();
-    const head = game.snake[0];
-    floatText(head.x, head.y - 1, "LEVEL " + nl, "#caff32");
-    sfx("level");
-    updateHUD();
-  }
+function nextLevel(reason) {
+  const previous = game.level;
+  game.level = previous % MAX_LEVEL + 1;
+  game.levelTransitions++;
+  game.levelScore = 0;
+  game.stepsWithoutFood = 0;
+  game.recentHeads = [];
+  game.snake = [];
+  const sx=Math.floor(COLS/2),sy=Math.floor(ROWS/2);
+  for(let i=0;i<START_LEN;i++) game.snake.push({x:sx-i,y:sy});
+  game.prevSnake=game.snake.map(p=>({...p}));
+  game.dir="right";
+  game.pendingGrow=0;
+  game.prog=0;
+  game.ghostTime=0;
+  game.boostTime=0;
+  game.dead=false;
+  game.dying=0;
+  game.obstacles=new Set();
+  game.food=null;
+  game.stepMs=Math.max(MIN_STEP_MS,BASE_STEP_MS-(game.level-1)*7);
+  // Keep a navigable arena: random obstacles can isolate food and trap the AI.
+  // Each level varies by speed and colour without blocking its path.
+  spawnFood();
+  overlayEl.classList.remove("show");
+  particles=[]; floats=[];
+  floatText(sx,sy-2,"LEVEL "+game.level,"#caff32");
+  sfx("level");
+  updateHUD();
 }
-
-/* ============================================================
-   11. HUD
-   ============================================================ */
+function checkLevelUp() {
+  if(game.levelScore>=LEVEL_SCORE) { nextLevel("score"); return true; }
+  return false;
+}
 function updateHUD() {
   scoreEl.textContent = game.score;
   levelEl.textContent = game.level;
@@ -1100,6 +1103,9 @@ function resetGame() {
   game.pendingGrow = 0;
   game.score = 0;
   game.level = 1;
+  game.levelScore = 0;
+  game.stepsWithoutFood = 0;
+  game.recentHeads = [];
   game.stepMs = BASE_STEP_MS;
   game.prog = 0;
   game.dead = false;
@@ -1159,7 +1165,7 @@ function showGameOver() {
   ovLevel.textContent = game.level;
   ovBest.textContent = game.best;
   overlayEl.classList.add("show");
-  game.autoRestartTimer = setTimeout(resetGame, 1400);
+  game.autoRestartTimer = setTimeout(() => nextLevel("collision"), 1400);
 }
 
 /* ============================================================
@@ -1182,10 +1188,11 @@ function stepGame() {
   if (wrap) { nx=(nx+COLS)%COLS; ny=(ny+ROWS)%ROWS; }
   else if (nx<0||nx>=COLS||ny<0||ny>=ROWS) { die(); return; }
 
-  if (!wrap && game.obstacles.has(nx+","+ny)) { die(); return; }
+  if (game.obstacles.has(nx+","+ny)) { die(); return; }
 
-  if (!wrap) {
-    const tailMoves = game.pendingGrow <= 0;
+  {
+    const eatingNext = game.food && game.food.x===nx && game.food.y===ny;
+    const tailMoves = game.pendingGrow + (eatingNext ? game.food.grow : 0) <= 0;
     const limit = game.snake.length - (tailMoves ? 1 : 0);
     for (let i=0;i<limit;i++){
       if (game.snake[i].x===nx && game.snake[i].y===ny) { die(); return; }
@@ -1197,6 +1204,9 @@ function stepGame() {
   if (game.food && game.food.x===nx && game.food.y===ny) {
     const f = game.food;
     game.score += f.points;
+    game.levelScore += f.points;
+    game.stepsWithoutFood = 0;
+    game.recentHeads = [];
     game.pendingGrow += f.grow;
 
     burst(f.x, f.y, f.color, 16);
@@ -1210,7 +1220,7 @@ function stepGame() {
 
     if (game.score > game.best) { game.best = game.score; saveBest(); }
     updateHUD();
-    checkLevelUp();
+    if (checkLevelUp()) return;
     spawnFood();
   }
 
@@ -1220,6 +1230,11 @@ function stepGame() {
   else net=0;
   let pop = 1 - net;
   while (pop-- > 0 && game.snake.length > 3) game.snake.pop();
+  game.stepsWithoutFood++;
+  game.recentHeads.push(idx(nx,ny));
+  if(game.recentHeads.length>65) game.recentHeads.shift();
+  // A watchdog prevents an endless repeating path even if the food is unreachable.
+  if(game.stepsWithoutFood >= STUCK_STEPS) nextLevel("stuck");
 }
 
 /* ============================================================
@@ -1524,7 +1539,9 @@ function loop(now) {
     let guard = 0;
     while (game.prog >= 1 && guard < 4) {
       game.prog -= 1;
+      const oldLevel=game.level;
       stepGame();
+      if(game.level!==oldLevel) { game.prog=0; break; }
       guard++;
       if (game.dead) break;
     }
